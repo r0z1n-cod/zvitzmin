@@ -5,7 +5,6 @@ import logging
 import random
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from telegram import InputMediaPhoto, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -15,6 +14,7 @@ from app.openai_client import AIAnalysisError, validate_checkpoint_photo
 from app.settings import load_settings
 from app.shift_config import load_shift_plan
 from app.storage import build_photo_path, build_report_path, save_report
+from app.timezone import get_timezone
 
 
 logging.basicConfig(
@@ -73,7 +73,7 @@ async def _start_mode_session(application: Application, chat_id: int, mode_code:
         "mode_code": mode_code,
         "step_index": 0,
         "results": [],
-        "started_at": datetime.now(ZoneInfo(application.bot_data["settings"].timezone)).isoformat(),
+        "started_at": datetime.now(get_timezone(application.bot_data["settings"].timezone)).isoformat(),
     }
 
     checklist_text = _build_steps_text(mode_config)
@@ -296,7 +296,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             image_path=ai_photo_path,
             mode_label=mode_config["label"],
             checkpoint=step,
-            received_at=message.date.astimezone(ZoneInfo(settings.timezone)),
+            received_at=message.date.astimezone(get_timezone(settings.timezone)),
             exif_datetime=get_exif_datetime(photo_path),
         )
     except AIAnalysisError as exc:
@@ -331,7 +331,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     session["step_index"] += 1
     if session["step_index"] >= len(mode_config["steps"]):
-        finished_at = datetime.now(ZoneInfo(settings.timezone))
+        finished_at = datetime.now(get_timezone(settings.timezone))
         summary = _format_summary(mode_config["label"], session["results"])
         detailed_report = _format_detailed_report(
             mode_config=mode_config,
@@ -366,7 +366,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def reminder_loop(application: Application) -> None:
     settings = application.bot_data["settings"]
-    timezone = ZoneInfo(settings.timezone)
+    timezone = get_timezone(settings.timezone)
     sent_marks: set[str] = set()
     planned_marks: dict[str, list[str]] = {}
     while True:
