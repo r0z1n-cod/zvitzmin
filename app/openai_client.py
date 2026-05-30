@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,25 @@ def _image_to_data_url(image_path: Path) -> str:
     suffix = image_path.suffix.lower().replace(".", "") or "jpeg"
     mime = "jpeg" if suffix == "jpg" else suffix
     return f"data:image/{mime};base64,{encoded}"
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("Expected JSON object", cleaned, 0)
+    return parsed
 
 
 def validate_checkpoint_photo(
@@ -74,7 +94,7 @@ def validate_checkpoint_photo(
             ],
         )
         content = response.output_text.strip()
-        return json.loads(content)
+        return _parse_json_object(content)
     except json.JSONDecodeError as exc:
         raise AIAnalysisError("ШІ повернув некоректну відповідь. Спробуйте ще раз з іншим фото.") from exc
     except RateLimitError as exc:

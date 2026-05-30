@@ -46,7 +46,8 @@ def _help_text() -> str:
         "Команди:\n"
         "/start - почати\n"
         "/help - підказка\n"
-        "/status - поточний режим"
+        "/status - поточний режим і прогрес\n"
+        "/cancel - скасувати поточну перевірку"
     )
 
 
@@ -104,8 +105,25 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     mode_config = _get_mode_config(context.application, session["mode_code"])
     current_step = mode_config["steps"][session["step_index"]]
+    done_count = len(session["results"])
+    total_count = len(mode_config["steps"])
     await update.message.reply_text(
-        f"Зараз режим: {mode_config['label']}\nЧекаю фото: {current_step['title']}"
+        f"Зараз режим: {mode_config['label']}\n"
+        f"Прогрес: {done_count}/{total_count}\n"
+        f"Чекаю фото: {current_step['title']}"
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = context.chat_data.pop("session", None)
+    if not session:
+        await update.message.reply_text("Активної перевірки зараз немає.", reply_markup=KEYBOARD)
+        return
+
+    mode_config = _get_mode_config(context.application, session["mode_code"])
+    await update.message.reply_text(
+        f"Перевірку скасовано: {mode_config['label']}. Можна обрати новий режим.",
+        reply_markup=KEYBOARD,
     )
 
 
@@ -113,8 +131,16 @@ async def select_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.message.text or "").strip()
     mode_code = MODE_MAP.get(text)
     if not mode_code:
+        await update.message.reply_text(
+            "Не впізнав команду. Оберіть режим кнопкою або напишіть /help.",
+            reply_markup=KEYBOARD,
+        )
         return
 
+    if context.chat_data.get("session"):
+        await update.message.reply_text(
+            "Починаю нову перевірку і замінюю попередню незавершену сесію."
+        )
     await _start_mode_session(context.application, update.effective_chat.id, mode_code)
     if mode_code in {"opening", "day"}:
         context.application.bot_data["active_day_targets"].add(update.effective_chat.id)
@@ -133,6 +159,41 @@ def _format_summary(mode_label: str, results: list[dict]) -> str:
     lines = [f"{mode_label} завершено"]
     for item in results:
         lines.append(f"- {item['title']}: {item['status']} | {item['problem']}")
+    return "\n".join(lines)
+
+
+def _format_detailed_report(
+    *,
+    mode_config: dict,
+    user_full_name: str,
+    user_id: int,
+    started_at: str,
+    finished_at: datetime,
+    results: list[dict],
+) -> str:
+    lines = [
+        "Звіт зміни",
+        f"Тип: {mode_config['label']}",
+        f"Від: {user_full_name}",
+        f"User ID: {user_id}",
+        f"Початок: {started_at}",
+        f"Завершено: {finished_at.isoformat()}",
+        f"Фото прийнято: {len(results)}/{len(mode_config['steps'])}",
+        "",
+        "Підсумок:",
+    ]
+    for index, item in enumerate(results, start=1):
+        lines.extend(
+            [
+                f"{index}. {item['title']}",
+                f"   Статус: {item['status']}",
+                f"   Добре: {item['good'] or 'Без окремого коментаря.'}",
+                f"   Проблема: {item['problem']}",
+                f"   Дія: {item['action']}",
+                f"   Свіжість: {item['freshness']}",
+                f"   Файл: {item['photo_path']}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -164,11 +225,21 @@ async def _send_report_album(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: str,
     summary_text: str,
+    report_path: Path,
     results: list[dict],
 ) -> None:
+    async def send_report_document() -> None:
+        with report_path.open("rb") as report_file:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=report_file,
+                filename=report_path.name,
+            )
+
     photo_results = [item for item in results if item.get("photo_path")]
     if not photo_results:
         await context.bot.send_message(chat_id=chat_id, text=summary_text[:4000])
+        await send_report_document()
         return
 
     media_items = []
@@ -187,6 +258,8 @@ async def _send_report_album(
                 )
             )
         await context.bot.send_media_group(chat_id=chat_id, media=media_items)
+        await context.bot.send_message(chat_id=chat_id, text=summary_text[:4000])
+        await send_report_document()
     finally:
         for file_handle in file_handles:
             file_handle.close()
@@ -246,6 +319,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         {
             "title": step["title"],
             "status": result.get("status", "Увага"),
+            "good": result.get("good", ""),
             "problem": result.get("problem", "Явних проблем не видно."),
             "action": result.get("action", "Продовжувати по чеклісту."),
             "freshness": result.get("freshness", "unclear"),
@@ -257,9 +331,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     session["step_index"] += 1
     if session["step_index"] >= len(mode_config["steps"]):
+        finished_at = datetime.now(ZoneInfo(settings.timezone))
         summary = _format_summary(mode_config["label"], session["results"])
+        detailed_report = _format_detailed_report(
+            mode_config=mode_config,
+            user_full_name=user.full_name,
+            user_id=user.id,
+            started_at=session["started_at"],
+            finished_at=finished_at,
+            results=session["results"],
+        )
         report_path = build_report_path(user.id, session["mode_code"])
-        save_report(report_path, summary)
+        save_report(report_path, detailed_report)
 
         await message.reply_text(f"{mode_config['label']} завершено.")
         report_chat_id = settings.telegram_report_chat_id
@@ -271,6 +354,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     f"Звіт зміни\nТип: {mode_config['label']}\n"
                     f"Від: {user.full_name}\nUser ID: {user.id}\n\n{summary}"
                 ),
+                report_path=report_path,
                 results=session["results"],
             )
         context.chat_data.pop("session", None)
@@ -297,6 +381,8 @@ async def reminder_loop(application: Application) -> None:
             if now.strftime("%H:%M") >= f"{hour_text}:{minute_text}":
                 sent_marks.add(mark)
                 for chat_id in list(application.bot_data["active_day_targets"]):
+                    if application.chat_data[chat_id].get("session"):
+                        continue
                     await _start_mode_session(application, chat_id, "day")
         sent_marks = {item for item in sent_marks if item.startswith(today)}
         await asyncio.sleep(30)
@@ -337,6 +423,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, select_mode))
     application.add_error_handler(error_handler)
