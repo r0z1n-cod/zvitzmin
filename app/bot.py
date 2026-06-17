@@ -34,6 +34,20 @@ KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+STATUS_ICONS = {
+    "Добре": "🟢",
+    "Увага": "🟡",
+    "Критично": "🔴",
+}
+
+NO_PROBLEM_MARKERS = {
+    "",
+    "явних проблем не видно",
+    "явних проблем не видно.",
+    "проблем не видно",
+    "проблем не виявлено",
+}
+
 
 def _help_text() -> str:
     return (
@@ -162,6 +176,48 @@ def _format_summary(mode_label: str, results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _status_icon(status: str) -> str:
+    return STATUS_ICONS.get(status, "⚪")
+
+
+def _has_actionable_issue(item: dict) -> bool:
+    problem = item.get("problem", "").strip().lower()
+    return item.get("status") != "Добре" or problem not in NO_PROBLEM_MARKERS
+
+
+def _format_manager_report(
+    *,
+    mode_label: str,
+    user_full_name: str,
+    results: list[dict],
+) -> str:
+    issues = [item for item in results if _has_actionable_issue(item)]
+    good_count = sum(1 for item in results if item.get("status") == "Добре")
+    attention_count = sum(1 for item in results if item.get("status") == "Увага")
+    critical_count = sum(1 for item in results if item.get("status") == "Критично")
+
+    lines = [
+        f"📸 {mode_label}",
+        f"👤 {user_full_name}",
+        f"🟢 {good_count}  🟡 {attention_count}  🔴 {critical_count}",
+        "",
+    ]
+
+    if not issues:
+        lines.append("✅ Зауважень немає. Усі фото прийняті.")
+        return "\n".join(lines)
+
+    lines.append("⚠️ Зауваження:")
+    for item in issues:
+        lines.append(
+            f"{_status_icon(item.get('status', ''))} {item['title']}: {item['problem']}"
+        )
+        action = item.get("action", "").strip()
+        if action and action != "Продовжувати по чеклісту.":
+            lines.append(f"   ↳ {action}")
+    return "\n".join(lines)
+
+
 def _format_detailed_report(
     *,
     mode_config: dict,
@@ -224,31 +280,22 @@ async def _send_report_album(
     *,
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: str,
-    summary_text: str,
-    report_path: Path,
+    report_text: str,
     results: list[dict],
 ) -> None:
-    async def send_report_document() -> None:
-        with report_path.open("rb") as report_file:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=report_file,
-                filename=report_path.name,
-            )
-
     photo_results = [item for item in results if item.get("photo_path")]
     if not photo_results:
-        await context.bot.send_message(chat_id=chat_id, text=summary_text[:4000])
-        await send_report_document()
+        await context.bot.send_message(chat_id=chat_id, text=report_text[:4000])
         return
 
     media_items = []
     file_handles = []
     try:
+        caption_in_album = len(report_text) <= 1024
         for index, item in enumerate(photo_results[:10]):
             caption = None
-            if index == 0:
-                caption = summary_text[:1024]
+            if index == 0 and caption_in_album:
+                caption = report_text
             file_handle = Path(item["photo_path"]).open("rb")
             file_handles.append(file_handle)
             media_items.append(
@@ -258,8 +305,8 @@ async def _send_report_album(
                 )
             )
         await context.bot.send_media_group(chat_id=chat_id, media=media_items)
-        await context.bot.send_message(chat_id=chat_id, text=summary_text[:4000])
-        await send_report_document()
+        if not caption_in_album:
+            await context.bot.send_message(chat_id=chat_id, text=report_text[:4000])
     finally:
         for file_handle in file_handles:
             file_handle.close()
@@ -332,7 +379,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     session["step_index"] += 1
     if session["step_index"] >= len(mode_config["steps"]):
         finished_at = datetime.now(get_timezone(settings.timezone))
-        summary = _format_summary(mode_config["label"], session["results"])
+        manager_report = _format_manager_report(
+            mode_label=mode_config["label"],
+            user_full_name=user.full_name,
+            results=session["results"],
+        )
         detailed_report = _format_detailed_report(
             mode_config=mode_config,
             user_full_name=user.full_name,
@@ -350,11 +401,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _send_report_album(
                 context=context,
                 chat_id=report_chat_id,
-                summary_text=(
-                    f"Звіт зміни\nТип: {mode_config['label']}\n"
-                    f"Від: {user.full_name}\nUser ID: {user.id}\n\n{summary}"
-                ),
-                report_path=report_path,
+                report_text=manager_report,
                 results=session["results"],
             )
         context.chat_data.pop("session", None)
